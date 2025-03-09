@@ -1,20 +1,32 @@
-import requests
 import json
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 import httpx
-from app.config import HUGGINGFACE_API_KEY
+import re
+import os
 from bs4 import BeautifulSoup
 
-# Headers for HuggingFace API requests
-headers = {
-    "Authorization": f"Bearer {HUGGINGFACE_API_KEY}",
-    "Content-Type": "application/json"
-}
+# LangChain imports
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_community.llms import Ollama
+from langchain_core.runnables import RunnablePassthrough
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
 
-# Using Llama models from Hugging Face
-# You can replace these with other Llama variants based on your needs
-LLAMA_TEXT_GENERATION_API = "https://api-inference.huggingface.co/models/meta-llama/Llama-2-7b-chat-hf"
-LLAMA_CLASSIFICATION_API = "https://api-inference.huggingface.co/models/meta-llama/Llama-2-7b-hf"
+# Configuration for Ollama
+# By default, Ollama runs on localhost:11434
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+# You can choose any model you've pulled with Ollama
+# Common options: llama3, llama2, mistral, gemma, etc.
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")  # Default to llama3
+
+# Initialize the Ollama model
+llm = Ollama(
+    model="mistral-nemo",
+    temperature=0.7,
+    num_ctx=4096,  # Context window size
+    num_predict=512  # Maximum tokens to generate
+)
 
 async def fetch_url_content(url: str) -> str:
     """Fetch the content of a URL and extract relevant text."""
@@ -85,8 +97,8 @@ async def fetch_url_content(url: str) -> str:
                 # Fall back to body text if no main content area identified
                 main_content = soup.body.get_text(separator=' ', strip=True) if soup.body else ""
             
-            # Limit to a reasonable length for the API
-            main_content = main_content[:1500]
+            # Limit to a reasonable length for the LLM
+            main_content = main_content[:1000]
             
             # Look for any lists that might contain important information
             list_items = []
@@ -113,69 +125,60 @@ async def fetch_url_content(url: str) -> str:
         return f"Could not fetch content from {url}. This appears to be from {domain}."
 
 async def generate_title_description(url: str) -> Tuple[str, str]:
-    """Generate a title and description for a bookmark using Llama."""
+    """Generate a title and description for a bookmark using Ollama."""
     try:
         # Fetch content from the URL
         content = await fetch_url_content(url)
         
-        # Format prompt for Llama (these models often need specific prompt formatting)
-        title_prompt = f"""<s>[INST] Generate a concise, descriptive title (maximum 10 words) for this web page content:
+        # Create a prompt for title and description generation
+        combined_template = PromptTemplate(
+            input_variables=["content"],
+            template="""Based on the following web page content, generate:
+1. A concise, descriptive title (maximum 10 words)
+2. A brief summary (1-2 sentences)
 
-{content}
+Format your response exactly like this:
+Title: [your generated title]
+Description: [your generated description]
 
-Title: [/INST]"""
+Web content:
+{content}"""
+        )
         
-        title_payload = {
-            "inputs": title_prompt,
-            "parameters": {
-                "max_new_tokens": 30,
-                "temperature": 0.7,
-                "top_p": 0.9,
-                "do_sample": True
-            }
-        }
+        # Use the modern pipe syntax
+        combined_chain = combined_template | llm | StrOutputParser()
         
-        title_response = requests.post(LLAMA_TEXT_GENERATION_API, headers=headers, json=title_payload)
-        title_response.raise_for_status()
+        # Call the chain with await and invoke
+        combined_result = await combined_chain.ainvoke({"content": content[:1500]})
         
-        # Parse Llama response (format may vary depending on model)
-        title_text = title_response.json()[0].get("generated_text", "")
-        # Extract the part after the prompt
-        if '[/INST]' in title_text:
-            title = title_text.split('[/INST]')[1].strip()
-        else:
-            title = title_text.replace(title_prompt, "").strip()
+        # Parse the results
+        title = ""
+        description = ""
         
-        # Format description prompt for Llama
-        desc_prompt = f"""<s>[INST] Summarize the following web page content in one or two sentences:
-
-{content}
-
-Summary: [/INST]"""
+        for line in combined_result.split('\n'):
+            line = line.strip()
+            if line.startswith("Title:"):
+                title = line[6:].strip()
+            elif line.startswith("Description:"):
+                description = line[12:].strip()
         
-        desc_payload = {
-            "inputs": desc_prompt,
-            "parameters": {
-                "max_new_tokens": 100,
-                "temperature": 0.7,
-                "top_p": 0.9,
-                "do_sample": True
-            }
-        }
+        # If parsing failed, use fallbacks
+        if not title or len(title) < 5:
+            # Extract title from the original content
+            original_title = ""
+            title_match = content.split("\n")[0] if "\n" in content else ""
+            if title_match.startswith("Title:"):
+                original_title = title_match[6:].strip()
+            title = original_title if original_title else url.split("//")[-1].split("/")[0]
         
-        desc_response = requests.post(LLAMA_TEXT_GENERATION_API, headers=headers, json=desc_payload)
-        desc_response.raise_for_status()
-        
-        # Parse Llama response
-        desc_text = desc_response.json()[0].get("generated_text", "")
-        if '[/INST]' in desc_text:
-            description = desc_text.split('[/INST]')[1].strip()
-        else:
-            description = desc_text.replace(desc_prompt, "").strip()
-        
-        # Clean up potential artifacts
-        title = title.replace("<s>", "").replace("</s>", "").strip()
-        description = description.replace("<s>", "").replace("</s>", "").strip()
+        if not description or len(description) < 10:
+            # Extract description from the original content
+            original_desc = ""
+            for line in content.split("\n"):
+                if line.startswith("Description:"):
+                    original_desc = line[12:].strip()
+                    break
+            description = original_desc if original_desc else "No description available."
         
         return title, description
     except Exception as e:
@@ -184,89 +187,52 @@ Summary: [/INST]"""
         return url.split("//")[-1].split("/")[0], "No description available"
 
 async def suggest_folder(title: str, description: str, existing_folders: list) -> str:
-    """Suggest a human-like folder name based on the bookmark content using Llama."""
+    """Suggest a folder name based on the bookmark content using Ollama."""
     try:
-        # First, check if any existing folders semantically match the content
-        if existing_folders:
-            # Format prompt for Llama
-            match_prompt = f"""<s>[INST] I have a bookmark with title '{title}' and description '{description}'.
-
-Which of these folders would be the best match for it: {', '.join(existing_folders)}?
-If none of these folders is a good semantic match, respond with "NONE".
-
-Answer with just the folder name or "NONE". [/INST]"""
-            
-            match_payload = {
-                "inputs": match_prompt,
-                "parameters": {
-                    "max_new_tokens": 30,
-                    "temperature": 0.2,  # Lower temperature for more predictable answers
-                    "top_p": 0.9,
-                    "do_sample": True
-                }
-            }
-            
-            match_response = requests.post(LLAMA_TEXT_GENERATION_API, headers=headers, json=match_payload)
-            match_response.raise_for_status()
-            
-            match_text = match_response.json()[0].get("generated_text", "")
-            if '[/INST]' in match_text:
-                suggested_folder = match_text.split('[/INST]')[1].strip()
-            else:
-                suggested_folder = match_text.replace(match_prompt, "").strip()
-            
-            # Clean up the response to just get the folder name
-            suggested_folder = suggested_folder.split()[0] if suggested_folder else ""
-            
-            # Only use existing folder if it's explicitly matched and not NONE
-            if suggested_folder in existing_folders and suggested_folder.upper() != "NONE":
-                # Double-check the relevance - ask for confidence score (0-10)
-                # Format confidence prompt for Llama
-                confidence_prompt = f"""<s>[INST] On a scale of 0-10, how confident are you that the bookmark with:
-Title: '{title}'
-Description: '{description}'
-belongs in the folder '{suggested_folder}'?
-
-Answer with just a number. [/INST]"""
-                
-                confidence_payload = {
-                    "inputs": confidence_prompt,
-                    "parameters": {
-                        "max_new_tokens": 10,
-                        "temperature": 0.2,
-                        "top_p": 0.9,
-                        "do_sample": True
-                    }
-                }
-                
-                confidence_response = requests.post(LLAMA_TEXT_GENERATION_API, headers=headers, json=confidence_payload)
-                confidence_response.raise_for_status()
-                
-                confidence_text = confidence_response.json()[0].get("generated_text", "")
-                if '[/INST]' in confidence_text:
-                    confidence = confidence_text.split('[/INST]')[1].strip()
-                else:
-                    confidence = confidence_text.replace(confidence_prompt, "").strip()
-                
-                try:
-                    # Extract the first number in the response
-                    import re
-                    confidence_match = re.search(r'\d+', confidence)
-                    if confidence_match:
-                        confidence_score = int(confidence_match.group())
-                        # Only use the existing folder if confidence is high
-                        if confidence_score >= 7:
-                            return suggested_folder
-                except Exception as e:
-                    print(f"Error parsing confidence score: {e}")
-                    # If we can't parse the confidence, be cautious and create a new folder
-                    pass
+        combined_content = f"{title} - {description}"
         
-        # If no good match or low confidence, suggest a new broad category folder name
-        # Format new folder prompt for Llama
-        new_folder_prompt = f"""<s>[INST] Based on this bookmark with title '{title}' and description '{description}', suggest a broad, generic category folder name that a human would create to organize this content.
+        # If there are existing folders, check if content matches any of them
+        if existing_folders:
+            # Create a prompt that asks the model to pick the best matching folder or suggest a new one
+            matching_template = PromptTemplate(
+                input_variables=["content", "folders"],
+                template="""Consider this content: "{content}"
 
-Folder names should be general categories, not specific to the bookmark content.
+Here are the existing folders: {folders}
+
+Step 1: Evaluate if the content clearly belongs in one of the existing folders.
+Step 2: If it does belong in an existing folder, respond with just that folder name.
+Step 3: If it doesn't clearly match any existing folder, respond with a new suggested folder name (maximum 3 words).
+
+Your response should be ONLY the folder name, nothing else."""
+            )
+            
+            # Join the folders as a comma-separated list for the prompt
+            folders_str = ", ".join([f'"{f}"' for f in existing_folders])
+            
+            # Use the modern pipe syntax
+            matching_chain = matching_template | llm | StrOutputParser()
+            
+            # Call the chain with await and invoke
+            folder_suggestion = await matching_chain.ainvoke({
+                "content": combined_content, 
+                "folders": folders_str
+            })
+            
+            # Clean up the response
+            folder_suggestion = folder_suggestion.strip().replace('"', '').replace("'", "")
+            
+            # Check if the suggestion matches an existing folder
+            for folder in existing_folders:
+                # Use case-insensitive comparison to improve matching
+                if folder.lower() == folder_suggestion.lower():
+                    return folder  # Return the exact folder name from the list
+        else:
+            # If no existing folders, just get a suggestion for a new one
+            suggestion_template = PromptTemplate(
+                input_variables=["content"],
+                template="""Suggest a broad, generic category folder name (2-3 words maximum) for content about:
+"{content}"
 
 Examples of good folder names:
 - "AI & Machine Learning"
@@ -277,69 +243,60 @@ Examples of good folder names:
 - "Health & Fitness"
 - "Book Recommendations"
 - "Tech News"
-- "Educational Resources"
-- "Business Strategy"
 
-Suggest just ONE simple, clear category name (2-3 words maximum). [/INST]"""
-        
-        new_folder_payload = {
-            "inputs": new_folder_prompt,
-            "parameters": {
-                "max_new_tokens": 30,
-                "temperature": 0.7,
-                "top_p": 0.9,
-                "do_sample": True
-            }
-        }
-        
-        new_folder_response = requests.post(LLAMA_TEXT_GENERATION_API, headers=headers, json=new_folder_payload)
-        new_folder_response.raise_for_status()
-        
-        new_folder_text = new_folder_response.json()[0].get("generated_text", "")
-        if '[/INST]' in new_folder_text:
-            suggested_category = new_folder_text.split('[/INST]')[1].strip()
-        else:
-            suggested_category = new_folder_text.replace(new_folder_prompt, "").strip()
-        
-        # Clean up potential artifacts and get first line only
-        suggested_category = suggested_category.replace("<s>", "").replace("</s>", "").strip()
-        suggested_category = suggested_category.split("\n")[0] if "\n" in suggested_category else suggested_category
-        
-        # Ensure we're getting a category, not specific content
-        if len(suggested_category.split()) > 3 or len(suggested_category) > 30:
-            # Too long or specific, try a second attempt with stricter instructions
-            # Format retry prompt for Llama
-            retry_prompt = f"""<s>[INST] Please provide a SHORT, GENERIC category name (maximum 3 words) for content about:
-'{title} - {description}'
-
-Examples: "Tech News", "Cooking", "Travel", "Finance", "Education"
-
-Just the category name: [/INST]"""
+Respond with ONLY the category name, nothing else."""
+            )
             
-            retry_payload = {
-                "inputs": retry_prompt,
-                "parameters": {
-                    "max_new_tokens": 20,
-                    "temperature": 0.3,
-                    "top_p": 0.9,
-                    "do_sample": True
-                }
-            }
+            # Use the modern pipe syntax
+            suggestion_chain = suggestion_template | llm | StrOutputParser()
             
-            retry_response = requests.post(LLAMA_TEXT_GENERATION_API, headers=headers, json=retry_payload)
-            retry_response.raise_for_status()
+            # Call the chain with await and invoke
+            folder_suggestion = await suggestion_chain.ainvoke({"content": combined_content})
             
-            retry_text = retry_response.json()[0].get("generated_text", "")
-            if '[/INST]' in retry_text:
-                suggested_category = retry_text.split('[/INST]')[1].strip()
-            else:
-                suggested_category = retry_text.replace(retry_prompt, "").strip()
-            
-            # Get only the first line and clean up
-            suggested_category = suggested_category.split("\n")[0] if "\n" in suggested_category else suggested_category
-            suggested_category = suggested_category.replace("<s>", "").replace("</s>", "").strip()
+            # Clean up the suggestion
+            folder_suggestion = folder_suggestion.strip().replace('"', '').replace("'", "")
         
-        return suggested_category
+        # Final cleanup and formatting
+        # Get only the first few words if too long
+        words = folder_suggestion.split()
+        if len(words) > 3:
+            folder_suggestion = " ".join(words[:3])
+            
+        return folder_suggestion if folder_suggestion and len(folder_suggestion) > 2 else "Uncategorized"
     except Exception as e:
         print(f"Error suggesting folder: {e}")
         return "Uncategorized"
+
+# Additional fallback function that can be used when API calls fail
+async def fallback_title_description(url: str, content: str) -> Tuple[str, str]:
+    """Generate a fallback title and description when the LLM fails."""
+    # Extract domain for the title
+    domain = url.split("//")[-1].split("/")[0]
+    
+    # Try to extract title from content
+    title = domain
+    description = "No description available."
+    
+    # Parse the content for better fallbacks
+    lines = content.split("\n")
+    for line in lines:
+        if line.startswith("Title:"):
+            extracted_title = line[6:].strip()
+            if extracted_title:
+                title = extracted_title
+        elif line.startswith("Description:"):
+            extracted_desc = line[12:].strip()
+            if extracted_desc:
+                description = extracted_desc
+    
+    # If content has meaningful text, use first sentence as description
+    if "Content:" in content:
+        content_parts = content.split("Content:")
+        if len(content_parts) > 1:
+            content_text = content_parts[1].strip()
+            # Get first sentence or first 100 chars
+            first_sentence = content_text.split(".")[0]
+            if len(first_sentence) > 10:
+                description = first_sentence[:100] + "..."
+    
+    return title, description
