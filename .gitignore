@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+/backend/venv
+/backend/.env
+/backend/*.db
+
+# Node
+/frontend/node_modules
+/frontend/.next/
+/frontend/.cache/
+/frontend/dist/
+
+# Environment variables
+/backend/.env
+/frontend/.env.local.example
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
