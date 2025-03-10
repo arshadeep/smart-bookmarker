@@ -7,6 +7,12 @@ import { deleteBookmark } from '../lib/api';
 export default function BookmarkList({ bookmarks, onDelete }) {
   const [deletingId, setDeletingId] = useState(null);
   const [error, setError] = useState(null);
+  const [localBookmarks, setLocalBookmarks] = useState(bookmarks);
+
+  // Update local bookmarks when the bookmarks prop changes
+  if (JSON.stringify(bookmarks) !== JSON.stringify(localBookmarks)) {
+    setLocalBookmarks(bookmarks);
+  }
 
   const handleDelete = async (id) => {
     try {
@@ -14,6 +20,9 @@ export default function BookmarkList({ bookmarks, onDelete }) {
       setError(null);
       
       await deleteBookmark(id);
+      
+      // Update local state
+      setLocalBookmarks(localBookmarks.filter(bookmark => bookmark.id !== id));
       
       // Call parent's onDelete if provided
       if (onDelete) {
@@ -27,7 +36,7 @@ export default function BookmarkList({ bookmarks, onDelete }) {
     }
   };
 
-  if (bookmarks.length === 0) {
+  if (localBookmarks.length === 0) {
     return <p className="text-gray-500 py-2">No bookmarks to display.</p>;
   }
 
@@ -35,7 +44,7 @@ export default function BookmarkList({ bookmarks, onDelete }) {
     <div className="space-y-3 mt-2">
       {error && <p className="text-red-500 text-sm">{error}</p>}
       
-      {bookmarks.map((bookmark) => (
+      {localBookmarks.map((bookmark) => (
         <BookmarkCard
           key={bookmark.id}
           bookmark={bookmark}

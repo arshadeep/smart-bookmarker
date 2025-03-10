@@ -1,5 +1,5 @@
 import json
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 import httpx
 import re
 import os
@@ -7,11 +7,13 @@ from bs4 import BeautifulSoup
 
 # LangChain imports
 from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
+from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
 from langchain_community.llms import Ollama
 from langchain_core.runnables import RunnablePassthrough
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
+from langchain.output_parsers import PydanticOutputParser
+from pydantic import BaseModel, Field
 
 # Configuration for Ollama
 # By default, Ollama runs on localhost:11434
@@ -27,6 +29,17 @@ llm = Ollama(
     num_ctx=4096,  # Context window size
     num_predict=512  # Maximum tokens to generate
 )
+
+# Define output schemas for structured responses
+class BookmarkMetadata(BaseModel):
+    title: str = Field(description="A concise, descriptive title for the bookmark")
+    description: str = Field(description="A brief summary of the bookmark content")
+    
+class CategorySuggestion(BaseModel):
+    primary_category: str = Field(description="The main category for the bookmark (e.g., Tech, Finance, Health)")
+    subcategory: str = Field(description="A more specific subcategory (e.g., Programming, Investing, Fitness)")
+    confidence_score: float = Field(description="A score from 0.0 to 1.0 indicating confidence in the categorization")
+    rationale: str = Field(description="Brief explanation of why this category was chosen")
 
 async def fetch_url_content(url: str) -> str:
     """Fetch the content of a URL and extract relevant text."""
@@ -111,51 +124,103 @@ async def fetch_url_content(url: str) -> str:
                 for item in list_el.find_all("li"):
                     list_items.append(item.get_text(strip=True))
             
+            # Look for keywords and tags
+            keywords = []
+            keyword_meta = soup.find("meta", attrs={"name": "keywords"})
+            if keyword_meta and "content" in keyword_meta.attrs:
+                keywords = [k.strip() for k in keyword_meta["content"].split(",")]
+            
             # Build the result
-            result = [f"Title: {title}", f"Description: {meta_desc}", f"Content: {main_content}"]
+            result = {
+                "title": title,
+                "description": meta_desc,
+                "content": main_content[:1500],  # Limit content size
+                "list_items": list_items[:10],   # Limit number of list items
+                "keywords": keywords[:10],       # Limit number of keywords
+                "url": url,
+                "domain": url.split("//")[-1].split("/")[0]
+            }
             
-            if list_items:
-                result.append("List Items: " + ", ".join(list_items[:10]))
-            
-            return "\n".join(result)
+            return json.dumps(result)
     except Exception as e:
         print(f"Error fetching URL content: {e}")
         # Return a general message with the URL
         domain = url.split("//")[-1].split("/")[0]
-        return f"Could not fetch content from {url}. This appears to be from {domain}."
+        return json.dumps({
+            "error": f"Could not fetch content from {url}",
+            "domain": domain,
+            "url": url
+        })
 
-async def generate_title_description(url: str) -> Tuple[str, str]:
-    """Generate a title and description for a bookmark using Ollama."""
+async def generate_title_description(url: str, user_note: str = "") -> Tuple[str, str]:
+    """Generate a title and description for a bookmark using content and optional user notes."""
     try:
         # Fetch content from the URL
-        content = await fetch_url_content(url)
+        content_json = await fetch_url_content(url)
+        content = json.loads(content_json)
         
-        # Create a prompt for title and description generation
-        combined_template = PromptTemplate(
-            input_variables=["content"],
-            template="""Based on the following web page content, generate:
-1. A concise, descriptive title (maximum 10 words)
-2. A brief summary (1-2 sentences)
+        # Create a prompt template with optional user note
+        if user_note:
+            prompt_text = """Generate a concise, informative title and brief description for this bookmark based on the webpage content and the user's notes.
+
+User's note about why they saved this bookmark: {user_note}
+
+Web page information:
+Title: {content_title}
+Description: {content_description}
+Content: {content_main}
+URL: {url}
+
+Your task:
+1. Generate a clear, descriptive title (maximum 10 words)
+2. Write a concise summary description (1-2 sentences)
 
 Format your response exactly like this:
 Title: [your generated title]
-Description: [your generated description]
+Description: [your generated description]"""
+        else:
+            prompt_text = """Generate a concise, informative title and brief description for this bookmark based on the webpage content.
 
-Web content:
-{content}"""
+Web page information:
+Title: {content_title}
+Description: {content_description}
+Content: {content_main}
+URL: {url}
+
+Your task:
+1. Generate a clear, descriptive title (maximum 10 words)
+2. Write a concise summary description (1-2 sentences)
+
+Format your response exactly like this:
+Title: [your generated title]
+Description: [your generated description]"""
+        
+        title_desc_template = PromptTemplate(
+            input_variables=["content_title", "content_description", "content_main", "url"] + (["user_note"] if user_note else []),
+            template=prompt_text
         )
         
         # Use the modern pipe syntax
-        combined_chain = combined_template | llm | StrOutputParser()
+        title_desc_chain = title_desc_template | llm | StrOutputParser()
         
-        # Call the chain with await and invoke
-        combined_result = await combined_chain.ainvoke({"content": content[:1500]})
+        # Prepare input data
+        input_data = {
+            "content_title": content.get("title", ""),
+            "content_description": content.get("description", ""),
+            "content_main": content.get("content", "")[:500],  # Limit size for prompt
+            "url": url
+        }
+        if user_note:
+            input_data["user_note"] = user_note
+        
+        # Call the chain
+        result = await title_desc_chain.ainvoke(input_data)
         
         # Parse the results
         title = ""
         description = ""
         
-        for line in combined_result.split('\n'):
+        for line in result.split('\n'):
             line = line.strip()
             if line.startswith("Title:"):
                 title = line[6:].strip()
@@ -164,139 +229,251 @@ Web content:
         
         # If parsing failed, use fallbacks
         if not title or len(title) < 5:
-            # Extract title from the original content
-            original_title = ""
-            title_match = content.split("\n")[0] if "\n" in content else ""
-            if title_match.startswith("Title:"):
-                original_title = title_match[6:].strip()
-            title = original_title if original_title else url.split("//")[-1].split("/")[0]
+            title = content.get("title", url.split("//")[-1].split("/")[0])
         
         if not description or len(description) < 10:
-            # Extract description from the original content
-            original_desc = ""
-            for line in content.split("\n"):
-                if line.startswith("Description:"):
-                    original_desc = line[12:].strip()
-                    break
-            description = original_desc if original_desc else "No description available."
+            description = content.get("description", "No description available.")
         
         return title, description
     except Exception as e:
         print(f"Error generating title/description: {e}")
         # Fallback to a simple title and description based on the URL
-        return url.split("//")[-1].split("/")[0], "No description available"
+        domain = url.split("//")[-1].split("/")[0]
+        return domain, "No description available"
 
-async def suggest_folder(title: str, description: str, existing_folders: list) -> str:
-    """Suggest a folder name based on the bookmark content using Ollama."""
+async def analyze_content_for_category(url: str, user_note: str, title: str, description: str) -> dict:
+    """
+    Analyze content to suggest categories with confidence scores.
+    Prioritizes user note but combines with scraped content for better categorization.
+    """
     try:
-        combined_content = f"{title} - {description}"
+        # Create a prompt for category analysis that incorporates user notes and webpage content
+        category_prompt = PromptTemplate(
+            input_variables=["url", "user_note", "title", "description"],
+            template="""Analyze the following information and suggest the best category and subcategory for organizing this bookmark:
+
+URL: {url}
+User's note: {user_note}
+Title: {title}
+Description: {description}
+
+1. Determine the primary category (e.g., Technology, Finance, Health, Education, Entertainment)
+2. Determine a more specific subcategory
+3. Provide a confidence score (0.0 to 1.0) indicating how confident you are
+4. Provide a brief rationale for your suggestion
+
+Your response should be valid JSON in the following format:
+{{
+  "primary_category": "string",
+  "subcategory": "string",
+  "confidence_score": float,
+  "rationale": "string"
+}}"""
+        )
         
-        # If there are existing folders, check if content matches any of them
-        if existing_folders:
-            # Create a prompt that asks the model to pick the best matching folder or suggest a new one
-            matching_template = PromptTemplate(
-                input_variables=["content", "folders"],
-                template="""Consider this content: "{content}"
-
-Here are the existing folders: {folders}
-
-Step 1: Evaluate if the content clearly belongs in one of the existing folders.
-Step 2: If it does belong in an existing folder, respond with just that folder name.
-Step 3: If it doesn't clearly match any existing folder, respond with a new suggested folder name (maximum 3 words).
-
-Your response should be ONLY the folder name, nothing else."""
-            )
-            
-            # Join the folders as a comma-separated list for the prompt
-            folders_str = ", ".join([f'"{f}"' for f in existing_folders])
-            
-            # Use the modern pipe syntax
-            matching_chain = matching_template | llm | StrOutputParser()
-            
-            # Call the chain with await and invoke
-            folder_suggestion = await matching_chain.ainvoke({
-                "content": combined_content, 
-                "folders": folders_str
-            })
-            
-            # Clean up the response
-            folder_suggestion = folder_suggestion.strip().replace('"', '').replace("'", "")
-            
-            # Check if the suggestion matches an existing folder
-            for folder in existing_folders:
-                # Use case-insensitive comparison to improve matching
-                if folder.lower() == folder_suggestion.lower():
-                    return folder  # Return the exact folder name from the list
-        else:
-            # If no existing folders, just get a suggestion for a new one
-            suggestion_template = PromptTemplate(
-                input_variables=["content"],
-                template="""Suggest a broad, generic category folder name (2-3 words maximum) for content about:
-"{content}"
-
-Examples of good folder names:
-- "AI & Machine Learning"
-- "Cooking Recipes"
-- "Web Development"
-- "Personal Finance"
-- "Travel Destinations"
-- "Health & Fitness"
-- "Book Recommendations"
-- "Tech News"
-
-Respond with ONLY the category name, nothing else."""
-            )
-            
-            # Use the modern pipe syntax
-            suggestion_chain = suggestion_template | llm | StrOutputParser()
-            
-            # Call the chain with await and invoke
-            folder_suggestion = await suggestion_chain.ainvoke({"content": combined_content})
-            
-            # Clean up the suggestion
-            folder_suggestion = folder_suggestion.strip().replace('"', '').replace("'", "")
+        # Create a parser for the response
+        class CategoryResponse(BaseModel):
+            primary_category: str
+            subcategory: str
+            confidence_score: float
+            rationale: str
         
-        # Final cleanup and formatting
-        # Get only the first few words if too long
-        words = folder_suggestion.split()
-        if len(words) > 3:
-            folder_suggestion = " ".join(words[:3])
-            
-        return folder_suggestion if folder_suggestion and len(folder_suggestion) > 2 else "Uncategorized"
+        parser = PydanticOutputParser(pydantic_object=CategoryResponse)
+        
+        # Use the chain
+        category_chain = category_prompt | llm | parser
+        
+        result = await category_chain.ainvoke({
+            "url": url,
+            "user_note": user_note,
+            "title": title,
+            "description": description
+        })
+        
+        # Convert Pydantic model to dict
+        return {
+            "primary_category": result.primary_category,
+            "subcategory": result.subcategory,
+            "confidence_score": result.confidence_score,
+            "rationale": result.rationale
+        }
     except Exception as e:
-        print(f"Error suggesting folder: {e}")
+        print(f"Error analyzing content for category: {e}")
+        # Provide a fallback response
+        return {
+            "primary_category": "Uncategorized",
+            "subcategory": "General",
+            "confidence_score": 0.3,
+            "rationale": "Could not analyze content properly due to an error."
+        }
+
+async def find_matching_folder(category_suggestion: dict, existing_folders: list) -> Optional[str]:
+    """
+    Find if there's a matching existing folder for the suggested category.
+    Uses a scoring system to find best matches rather than exact matches.
+    """
+    try:
+        primary_category = category_suggestion["primary_category"]
+        subcategory = category_suggestion["subcategory"]
+        
+        # No folders to match against
+        if not existing_folders:
+            return None
+            
+        # Format the input for the LLM
+        folder_match_prompt = PromptTemplate(
+            input_variables=["primary_category", "subcategory", "existing_folders"],
+            template="""Your task is to match a bookmark category to the closest existing folder.
+
+Bookmark categorization:
+Primary category: {primary_category}
+Subcategory: {subcategory}
+
+Existing folders: {existing_folders}
+
+Instructions:
+1. Analyze if the bookmark category conceptually belongs in any existing folder
+2. If there's a good match, return the exact name of the matching folder
+3. If there's no good match, return "create_new" to suggest creating a new folder
+4. Provide a confidence score between 0.0 and 1.0
+5. Briefly explain your reasoning
+
+Your response should be valid JSON in the following format:
+{{
+  "matching_folder": "string or create_new",
+  "confidence_score": float,
+  "reasoning": "string"
+}}"""
+        )
+        
+        # Create a simple output parser
+        class FolderMatchResponse(BaseModel):
+            matching_folder: str
+            confidence_score: float
+            reasoning: str
+        
+        parser = PydanticOutputParser(pydantic_object=FolderMatchResponse)
+        
+        # Use the chain
+        folder_match_chain = folder_match_prompt | llm | parser
+        
+        result = await folder_match_chain.ainvoke({
+            "primary_category": primary_category,
+            "subcategory": subcategory,
+            "existing_folders": ", ".join([f'"{f}"' for f in existing_folders])
+        })
+        
+        # If we should create a new folder, return None
+        if result.matching_folder == "create_new" or result.confidence_score < 0.65:
+            return None
+            
+        # Find the exact folder name in our list (case sensitive match)
+        for folder in existing_folders:
+            if folder == result.matching_folder:
+                return folder
+                
+        # No exact match found, check for case-insensitive match as fallback
+        for folder in existing_folders:
+            if folder.lower() == result.matching_folder.lower():
+                return folder
+                
+        # Still no match found
+        return None
+        
+    except Exception as e:
+        print(f"Error finding matching folder: {e}")
+        return None
+
+async def suggest_folder_name(category_suggestion: dict) -> str:
+    """
+    Generate a folder name suggestion based on category analysis.
+    """
+    try:
+        primary_category = category_suggestion["primary_category"]
+        subcategory = category_suggestion["subcategory"]
+        
+        folder_name_prompt = PromptTemplate(
+            input_variables=["primary_category", "subcategory"],
+            template="""Create a clear, concise folder name for bookmarks based on these categories:
+
+Primary category: {primary_category}
+Subcategory: {subcategory}
+
+Rules for the folder name:
+1. Keep it short (2-3 words maximum)
+2. Make it intuitive and user-friendly
+3. Focus on broad enough categorization that similar bookmarks could fit
+4. Use title case (capitalize main words)
+
+Response format:
+Folder: [your suggested folder name]"""
+        )
+        
+        folder_name_chain = folder_name_prompt | llm | StrOutputParser()
+        
+        result = await folder_name_chain.ainvoke({
+            "primary_category": primary_category,
+            "subcategory": subcategory
+        })
+        
+        # Extract folder name from the response
+        folder_name = ""
+        for line in result.split('\n'):
+            if line.startswith("Folder:"):
+                folder_name = line[7:].strip()
+                break
+                
+        # Clean and validate the folder name
+        if folder_name and len(folder_name) > 2:
+            # Limit to 30 characters
+            return folder_name[:30]
+        else:
+            # Fallback to primary category
+            return primary_category
+            
+    except Exception as e:
+        print(f"Error suggesting folder name: {e}")
         return "Uncategorized"
 
-# Additional fallback function that can be used when API calls fail
-async def fallback_title_description(url: str, content: str) -> Tuple[str, str]:
-    """Generate a fallback title and description when the LLM fails."""
-    # Extract domain for the title
-    domain = url.split("//")[-1].split("/")[0]
+async def suggest_folder(url: str, title: str, description: str, user_note: str, existing_folders: list) -> str:
+    """
+    Main function that suggests a folder for a bookmark using the enhanced algorithm.
+    1. Analyzes user note (if provided) and combined content
+    2. Checks for matching existing folders
+    3. Creates new folder suggestion if needed
+    """
+    try:
+        # Step 1: Analyze content to get category suggestion
+        category_data = await analyze_content_for_category(url, user_note, title, description)
+        
+        # Step 2: Check if any existing folder matches the category
+        matching_folder = await find_matching_folder(category_data, existing_folders)
+        
+        # If we found a matching folder, use it
+        if matching_folder:
+            return matching_folder
+            
+        # Step 3: No matching folder, suggest a new one
+        new_folder = await suggest_folder_name(category_data)
+        
+        return new_folder
+    except Exception as e:
+        print(f"Error in suggest_folder: {e}")
+        return "Uncategorized"
+
+# Main function used by the API endpoints
+async def process_bookmark(url: str, user_note: str = "", existing_folders: list = None) -> Tuple[str, str, str]:
+    """
+    Process a bookmark to generate title, description, and folder suggestion.
+    Implements the enhanced algorithm that prioritizes user notes and combines with web content.
+    """
+    if existing_folders is None:
+        existing_folders = []
+        
+    # Generate title and description
+    title, description = await generate_title_description(url, user_note)
     
-    # Try to extract title from content
-    title = domain
-    description = "No description available."
+    # Suggest folder based on combined analysis
+    folder_name = await suggest_folder(url, title, description, user_note, existing_folders)
     
-    # Parse the content for better fallbacks
-    lines = content.split("\n")
-    for line in lines:
-        if line.startswith("Title:"):
-            extracted_title = line[6:].strip()
-            if extracted_title:
-                title = extracted_title
-        elif line.startswith("Description:"):
-            extracted_desc = line[12:].strip()
-            if extracted_desc:
-                description = extracted_desc
-    
-    # If content has meaningful text, use first sentence as description
-    if "Content:" in content:
-        content_parts = content.split("Content:")
-        if len(content_parts) > 1:
-            content_text = content_parts[1].strip()
-            # Get first sentence or first 100 chars
-            first_sentence = content_text.split(".")[0]
-            if len(first_sentence) > 10:
-                description = first_sentence[:100] + "..."
-    
-    return title, description
+    return title, description, folder_name

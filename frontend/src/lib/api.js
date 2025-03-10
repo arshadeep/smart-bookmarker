@@ -107,3 +107,43 @@ export async function getFolderWithBookmarks(id) {
     throw error;
   }
 }
+
+export async function deleteFolder(id) {
+  try {
+    const response = await fetch(`${API_BASE_URL}/folders/${id}`, {
+      method: 'DELETE',
+    });
+    
+    if (!response.ok) {
+      // Try to parse error message from response
+      const errorData = await response.json();
+      throw new Error(errorData.detail || `Error: ${response.status}`);
+    }
+    
+    return await response.json();
+  } catch (error) {
+    console.error('Error deleting folder:', error);
+    throw error;
+  }
+}
+
+export async function createFolder(folderName) {
+  try {
+    const response = await fetch(`${API_BASE_URL}/folders`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ name: folderName }),
+    });
+    
+    if (!response.ok) {
+      throw new Error(`Error: ${response.status}`);
+    }
+    
+    return await response.json();
+  } catch (error) {
+    console.error('Error creating folder:', error);
+    throw error;
+  }
+}
