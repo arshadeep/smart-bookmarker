@@ -1,7 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException, status
-from typing import List
+from fastapi import APIRouter, Depends, HTTPException, status, Body
+from typing import List, Optional
 from sqlalchemy.orm import Session
-from app.db.database import get_db, SessionLocal
+from app.db.database import get_db
 from app.db.models import Bookmark, Folder
 from app.schemas.bookmark import BookmarkCreate, Bookmark as BookmarkSchema, BookmarkSuggestion
 from app.core.ai import generate_title_description, suggest_folder
@@ -12,7 +12,7 @@ router = APIRouter()
 async def create_bookmark(bookmark: BookmarkCreate, db: Session = Depends(get_db)):
     """Create a new bookmark with AI-generated title, description, and folder."""
     # Generate title and description using AI
-    title, description = await generate_title_description(str(bookmark.url))
+    title, description = await generate_title_description(str(bookmark.url), bookmark.user_note)
     
     # Get all existing folder names
     existing_folders = [folder.name for folder in db.query(Folder).all()]
@@ -47,7 +47,7 @@ async def create_bookmark(bookmark: BookmarkCreate, db: Session = Depends(get_db
 async def suggest_bookmark_metadata(bookmark: BookmarkCreate, db: Session = Depends(get_db)):
     """Generate title, description, and folder suggestion without saving."""
     # Generate title and description using AI
-    title, description = await generate_title_description(str(bookmark.url))
+    title, description = await generate_title_description(str(bookmark.url), bookmark.user_note)
     
     # Get all existing folder names
     existing_folders = [folder.name for folder in db.query(Folder).all()]
@@ -73,6 +73,38 @@ def read_bookmark(bookmark_id: int, db: Session = Depends(get_db)):
     bookmark = db.query(Bookmark).filter(Bookmark.id == bookmark_id).first()
     if bookmark is None:
         raise HTTPException(status_code=404, detail="Bookmark not found")
+    return bookmark
+
+@router.put("/{bookmark_id}", response_model=BookmarkSchema)
+def update_bookmark(
+    bookmark_id: int, 
+    title: Optional[str] = Body(None),
+    description: Optional[str] = Body(None),
+    user_note: Optional[str] = Body(None),
+    folder_id: Optional[int] = Body(None),
+    db: Session = Depends(get_db)
+):
+    """Update a bookmark's metadata."""
+    bookmark = db.query(Bookmark).filter(Bookmark.id == bookmark_id).first()
+    if bookmark is None:
+        raise HTTPException(status_code=404, detail="Bookmark not found")
+    
+    # Update only the fields that were provided
+    if title is not None:
+        bookmark.title = title
+    if description is not None:
+        bookmark.description = description
+    if user_note is not None:
+        bookmark.user_note = user_note
+    if folder_id is not None:
+        # Verify the folder exists
+        folder = db.query(Folder).filter(Folder.id == folder_id).first()
+        if not folder:
+            raise HTTPException(status_code=404, detail="Folder not found")
+        bookmark.folder_id = folder_id
+    
+    db.commit()
+    db.refresh(bookmark)
     return bookmark
 
 @router.delete("/{bookmark_id}")
