@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from app.db.database import get_db
 from app.db.models import Bookmark, Folder
 from app.schemas.bookmark import BookmarkCreate, Bookmark as BookmarkSchema, BookmarkSuggestion
-from app.core.ai import generate_title_description, suggest_folder
+from app.core.ai import generate_title_description, suggest_folder, enhanced_suggest_folder
 
 router = APIRouter()
 
@@ -17,12 +17,15 @@ async def create_bookmark(bookmark: BookmarkCreate, db: Session = Depends(get_db
     # Get all existing folder names
     existing_folders = [folder.name for folder in db.query(Folder).all()]
     
-    # Suggest a folder using AI
-    folder_name = await suggest_folder(title, description, existing_folders)
+    # Suggest a folder using AI - pass the user note explicitly to prioritize it
+    folder_name = await enhanced_suggest_folder(title, description, bookmark.user_note, existing_folders)
     
-    # Check if the folder exists, create it if it doesn't
-    folder = db.query(Folder).filter(Folder.name == folder_name).first()
+    # Check if the folder exists (case insensitive comparison)
+    folder = db.query(Folder).filter(Folder.name.ilike(folder_name)).first()
+    
+    # If no exact match but case-insensitive match exists, use the existing folder with its original casing
     if not folder:
+        # Create new folder if no match at all
         folder = Folder(name=folder_name)
         db.add(folder)
         db.commit()
@@ -52,8 +55,11 @@ async def suggest_bookmark_metadata(bookmark: BookmarkCreate, db: Session = Depe
     # Get all existing folder names
     existing_folders = [folder.name for folder in db.query(Folder).all()]
     
-    # Suggest a folder using AI
-    folder_name = await suggest_folder(title, description, existing_folders)
+    # Suggest a folder using AI - explicitly use enhanced version with user note
+    folder_name = await enhanced_suggest_folder(title, description, bookmark.user_note, existing_folders)
+    
+    # Standardize the folder name (trim extra spaces, fix capitalization if needed)
+    folder_name = folder_name.strip()
     
     return BookmarkSuggestion(
         title=title,

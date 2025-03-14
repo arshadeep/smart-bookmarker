@@ -30,17 +30,18 @@ export default function BookmarkCard({ bookmark, onDelete, isDeleting }) {
         </button>
       </div>
       
-      {bookmark.description && (
-        <p className="text-sm text-gray-600 mt-1 line-clamp-2 overflow-hidden">
-          {bookmark.description}
-        </p>
+      {/* Display user notes first if they exist */}
+      {bookmark.user_note && (
+        <div className="mt-2 text-sm bg-blue-50 p-2 rounded border-l-2 border-blue-300">
+          <p className="font-medium text-gray-700">Your note:</p>
+          <p className="text-gray-800">{bookmark.user_note}</p>
+        </div>
       )}
       
-      {bookmark.user_note && (
-        <div className="mt-2 text-sm">
-          <p className="font-medium text-gray-700">Your note:</p>
-          <p className="text-gray-600 italic">{bookmark.user_note}</p>
-        </div>
+      {bookmark.description && (
+        <p className="text-sm text-gray-600 mt-2 line-clamp-2 overflow-hidden">
+          {bookmark.description}
+        </p>
       )}
       
       <div className="mt-2 flex justify-between text-xs text-gray-500">

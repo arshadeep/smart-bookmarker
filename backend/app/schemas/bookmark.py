@@ -6,6 +6,10 @@ from datetime import datetime
 class BookmarkBase(BaseModel):
     url: HttpUrl
     user_note: Optional[str] = None
+    # Adding optional fields for when the frontend provides suggested values
+    title: Optional[str] = None
+    description: Optional[str] = None
+    folder_name: Optional[str] = None
 
 # Properties to receive on bookmark creation
 class BookmarkCreate(BookmarkBase):

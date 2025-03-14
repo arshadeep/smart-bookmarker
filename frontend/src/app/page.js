@@ -17,7 +17,7 @@ export default function Home() {
       setFolders(data);
       setError(null);
     } catch (err) {
-      setError('Failed to load folders. Please try again later.');
+      setError('Failed to load categories. Please try again later.');
       console.error(err);
     } finally {
       setIsLoading(false);
@@ -39,9 +39,9 @@ export default function Home() {
         </div>
         
         <div>
-          <h2 className="text-xl font-semibold mb-4">Your Bookmark Folders</h2>
+          <h2 className="text-xl font-semibold mb-4">Your Bookmark Categories</h2>
           {isLoading ? (
-            <p>Loading folders...</p>
+            <p>Loading categories...</p>
           ) : error ? (
             <p className="text-red-500">{error}</p>
           ) : (

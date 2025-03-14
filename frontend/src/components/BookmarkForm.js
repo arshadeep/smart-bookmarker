@@ -111,10 +111,13 @@ export default function BookmarkForm({ onSuccess }) {
               id="note"
               value={note}
               onChange={(e) => setNote(e.target.value)}
-              placeholder="Why are you saving this bookmark?"
+              placeholder="Why are you saving this bookmark? Adding notes helps with categorization!"
               className="w-full px-3 py-2 border border-gray-300 rounded-md"
               rows="3"
             />
+            <p className="text-xs text-gray-500 mt-1">
+              Adding your own notes will help with better categorization and organization.
+            </p>
           </div>
           
           {error && <p className="text-red-500 mb-4">{error}</p>}
@@ -139,7 +142,7 @@ export default function BookmarkForm({ onSuccess }) {
               <p className="font-medium">Description:</p>
               <p className="mb-2">{suggestion.description}</p>
               
-              <p className="font-medium">Folder:</p>
+              <p className="font-medium">Category:</p>
               <p className="mb-4">{suggestion.folder_name}</p>
             </div>
           )}

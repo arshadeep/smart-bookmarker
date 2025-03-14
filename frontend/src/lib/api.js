@@ -5,6 +5,7 @@ const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/a
 // Bookmark API functions
 export async function addBookmark(bookmark) {
   try {
+    // We now pass the full bookmark object which may include title, description, and folder_name
     const response = await fetch(`${API_BASE_URL}/bookmarks`, {
       method: 'POST',
       headers: {
@@ -138,7 +139,13 @@ export async function createFolder(folderName) {
     });
     
     if (!response.ok) {
-      throw new Error(`Error: ${response.status}`);
+      // Try to get detailed error message if available
+      try {
+        const errorData = await response.json();
+        throw new Error(errorData.detail || `Error: ${response.status}`);
+      } catch {
+        throw new Error(`Error: ${response.status}`);
+      }
     }
     
     return await response.json();

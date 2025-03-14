@@ -202,24 +202,35 @@ async def suggest_folder(title: str, description: str, existing_folders: list) -
 
 # Enhanced function with improved categorization
 async def enhanced_suggest_folder(title: str, description: str, user_note: str, existing_folders: list) -> str:
-    """Enhanced version that takes user note into account for better categorization."""
+    """Enhanced version that prioritizes user notes and treats folders as broad categories."""
     try:
-        combined_content = f"{title} - {description}"
-        if user_note:
-            combined_content = f"{user_note}\n\n{combined_content}"
+        # Prioritize user note if available by putting it first in the combined content
+        if user_note and user_note.strip():
+            # Give the user note higher weight by repeating it and placing it first
+            combined_content = f"USER NOTE (Important): {user_note}\n\nTitle: {title}\nDescription: {description}"
+        else:
+            combined_content = f"{title} - {description}"
         
         # If there are existing folders, check if content matches any of them
         if existing_folders:
             # Create a prompt that asks the model to pick the best matching folder or suggest a new one
+            # This revised prompt emphasizes that folders are categories and content can vaguely match
             matching_template = PromptTemplate(
                 input_variables=["content", "folders"],
                 template="""Consider this content: "{content}"
 
-Here are the existing folders: {folders}
+Here are the existing category folders: {folders}
 
-Step 1: Evaluate if the content clearly belongs in one of the existing folders.
-Step 2: If it does belong in an existing folder, respond with just that folder name.
-Step 3: If it doesn't clearly match any existing folder, respond with a new suggested folder name (maximum 3 words).
+IMPORTANT GUIDELINES:
+1. Treat folders as broad topic categories rather than precise matches.
+2. Bookmarked Content can belong to a category even if it's only vaguely related.
+3. If the user provided notes, those should be given priority in category matching.
+4. It's better to place content in an existing category than create a new one.
+5. Only suggest a new category if the content truly doesn't fit any existing categories.
+
+Step 1: Evaluate if the content could reasonably belong in one of the existing folder categories.
+Step 2: If it could belong in an existing folder, respond with just that folder name.
+Step 3: If it doesn't match any existing folder, respond with a new suggested folder name (maximum 3 words).
 
 Your response should be ONLY the folder name, nothing else."""
             )
@@ -243,7 +254,13 @@ Your response should be ONLY the folder name, nothing else."""
             for folder in existing_folders:
                 # Use case-insensitive comparison to improve matching
                 if folder.lower() == folder_suggestion.lower():
-                    return folder  # Return the exact folder name from the list
+                    return folder  # Return the exact folder name from the list with original casing
+                # Also match if the suggested folder is a substring of an existing folder (or vice versa)
+                elif (folder.lower() in folder_suggestion.lower() or 
+                      folder_suggestion.lower() in folder.lower()):
+                    # If there's significant overlap, use the existing folder
+                    if len(folder) >= 3 and len(folder_suggestion) >= 3:
+                        return folder
         else:
             # If no existing folders, just get a suggestion for a new one
             suggestion_template = PromptTemplate(
@@ -278,13 +295,19 @@ Respond with ONLY the category name, nothing else."""
         words = folder_suggestion.split()
         if len(words) > 3:
             folder_suggestion = " ".join(words[:3])
+        
+        # Standardize the folder name (proper capitalization, etc.)
+        folder_suggestion = folder_suggestion.strip()
+        
+        # Capitalize first letter of each word for consistency
+        folder_suggestion = " ".join(word.capitalize() for word in folder_suggestion.split())
             
         return folder_suggestion if folder_suggestion and len(folder_suggestion) > 2 else "Uncategorized"
     except Exception as e:
         print(f"Error suggesting folder: {e}")
         return "Uncategorized"
 
-# New function that combines all processing in one call - for future use
+# New function that combines all processing in one call
 async def process_bookmark(url: str, user_note: str = "", existing_folders: list = None) -> Tuple[str, str, str]:
     """
     Process a bookmark to generate title, description, and folder suggestion.
@@ -293,10 +316,32 @@ async def process_bookmark(url: str, user_note: str = "", existing_folders: list
     if existing_folders is None:
         existing_folders = []
         
-    # Generate title and description
+    # Generate title and description, making sure user_note is used
     title, description = await generate_title_description(url, user_note)
     
-    # Suggest folder based on combined analysis
+    # Suggest folder based on combined analysis with high priority for user notes
+    # If user provided a note, we should use it as a strong signal for categorization
     folder_name = await enhanced_suggest_folder(title, description, user_note, existing_folders)
+    
+    # If user's note directly suggests a category and we don't have a good match
+    # in existing folders, we should consider using keywords from the note as a category
+    if user_note and folder_name == "Uncategorized" and len(user_note.strip()) > 0:
+        # Create a special prompt for note-based categorization if all else fails
+        matching_template = PromptTemplate(
+            input_variables=["note"],
+            template="""Based solely on this user note, suggest a category name (2-3 words):
+"{note}"
+
+Respond with ONLY the category name."""
+        )
+        
+        # Try to extract a category from just the user's note as a last resort
+        try:
+            note_chain = matching_template | llm | StrOutputParser()
+            note_category = await note_chain.ainvoke({"note": user_note})
+            if note_category and len(note_category.strip()) > 3:
+                folder_name = note_category.strip()
+        except Exception as e:
+            print(f"Error extracting category from note: {e}")
     
     return title, description, folder_name
